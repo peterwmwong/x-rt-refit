@@ -56,7 +56,7 @@ class MyMetalView: MTKView {
         let enc = cmdBuf.makeRenderCommandEncoder(descriptor: currentRenderPassDescriptor!)!
         enc.setRenderPipelineState(pipeline)
         enc.useHeap(modelAccelStruct.primAccelStructHeap, stages: .fragment)
-        enc.setFragmentAccelerationStructure(modelAccelStruct.instAccelStruct, bufferIndex: 0)
+        enc.setFragmentAccelerationStructure(modelAccelStruct.primAccelStruct, bufferIndex: 0)
         enc.setFragmentBytes(&matrixScreenToWorld, length: MemoryLayout<float4x4>.size, index: 1)
         enc.setFragmentBytes(&CAMERA_POSITION, length: MemoryLayout<Float32>.size * 4, index: 2)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -145,24 +145,31 @@ class ModelAccelerationStructure {
     let vertexBuffer:              MTLBuffer
     let indexBuffer:               MTLBuffer
     
+    let primAccelStructDesc:       MTLPrimitiveAccelerationStructureDescriptor;
     let primAccelStructHeap:       MTLHeap
     let primAccelStruct:           MTLAccelerationStructure
-    let instAccelStruct:           MTLAccelerationStructure
-    let instAccelStructDesc:       MTLInstanceAccelerationStructureDescriptor
-    let instAccelStructDescBuffer: MTLBuffer
-    let instAccelStructRebuildBuf: MTLBuffer
-    let instAccelStructRefitBuf:   MTLBuffer
+    let primAccelStructRebuildBuf: MTLBuffer
+    let primAccelStructRefitBuf:   MTLBuffer
+    
+    let triAccelStruct:            MTLAccelerationStructureTriangleGeometryDescriptor
+    let triangleCount:             UInt32
     
     init(_ device: MTLDevice, _ cmdQueue: MTLCommandQueue) {
-        let triangleCount: UInt32 = loadResource(name: "triangleCount")
+        triangleCount      = loadResource(name: "triangleCount")
         matrixModelToWorld = loadResource(name: "matrixModelToWorld")
+        var matrixModelToWorldPacked = MTLPackedFloat4x3(columns: (
+            MTLPackedFloat3Make(matrixModelToWorld.columns.0.x, matrixModelToWorld.columns.0.y, matrixModelToWorld.columns.0.z),
+            MTLPackedFloat3Make(matrixModelToWorld.columns.1.x, matrixModelToWorld.columns.1.y, matrixModelToWorld.columns.1.z),
+            MTLPackedFloat3Make(matrixModelToWorld.columns.2.x, matrixModelToWorld.columns.2.y, matrixModelToWorld.columns.2.z),
+            MTLPackedFloat3Make(matrixModelToWorld.columns.3.x, matrixModelToWorld.columns.3.y, matrixModelToWorld.columns.3.z)
+        ))
         vertexBuffer = loadResourceAsMTLBuffer(device: device, name: "vertexBuffer")
         indexBuffer = loadResourceAsMTLBuffer(device: device, name: "indexBuffer")
         
         // ========================================
         // Define Primitive Acceleration Structures
         // ========================================
-        let triAccelStruct = MTLAccelerationStructureTriangleGeometryDescriptor()
+        triAccelStruct = MTLAccelerationStructureTriangleGeometryDescriptor()
         triAccelStruct.vertexFormat       = .float3
         triAccelStruct.vertexBuffer       = vertexBuffer
         triAccelStruct.vertexBufferOffset = 0
@@ -173,12 +180,16 @@ class ModelAccelerationStructure {
         triAccelStruct.triangleCount      = Int(triangleCount)
         triAccelStruct.opaque             = true
         triAccelStruct.label              = "triAccelStruct"
+        triAccelStruct.transformationMatrixBuffer = device.makeBuffer(bytes: &matrixModelToWorldPacked, length: MemoryLayout<MTLPackedFloat4x3>.size)
         
-        let primAccelStructDesc = MTLPrimitiveAccelerationStructureDescriptor()
+        primAccelStructDesc = MTLPrimitiveAccelerationStructureDescriptor()
         primAccelStructDesc.geometryDescriptors = [triAccelStruct]
         let sizeAlign = device.heapAccelerationStructureSizeAndAlign(descriptor: primAccelStructDesc)
         var primAccelStructSizes = device.accelerationStructureSizes(descriptor: primAccelStructDesc)
         primAccelStructSizes.accelerationStructureSize = sizeAlign.size + sizeAlign.align
+        
+        primAccelStructRebuildBuf = device.makeBuffer(length: primAccelStructSizes.buildScratchBufferSize)!
+        primAccelStructRefitBuf = device.makeBuffer(length: primAccelStructSizes.refitScratchBufferSize)!
         
         let primAccelStructHeapDesc = MTLHeapDescriptor()
         primAccelStructHeapDesc.storageMode = .private
@@ -190,37 +201,6 @@ class ModelAccelerationStructure {
         primAccelStructScratchBuf.label = "primAccelStructScratchBuf"
         
         // ======================================
-        // Define Instance Acceleration Structure
-        // ======================================
-        instAccelStructDesc = MTLInstanceAccelerationStructureDescriptor()
-        instAccelStructDesc.instancedAccelerationStructures = [primAccelStruct]
-        instAccelStructDesc.instanceCount                   = 1
-        
-        var instAccelStructDescBufferContents = MTLAccelerationStructureInstanceDescriptor(
-            transformationMatrix: MTLPackedFloat4x3(columns: (
-                MTLPackedFloat3Make(matrixModelToWorld.columns.0.x, matrixModelToWorld.columns.0.y, matrixModelToWorld.columns.0.z),
-                MTLPackedFloat3Make(matrixModelToWorld.columns.1.x, matrixModelToWorld.columns.1.y, matrixModelToWorld.columns.1.z),
-                MTLPackedFloat3Make(matrixModelToWorld.columns.2.x, matrixModelToWorld.columns.2.y, matrixModelToWorld.columns.2.z),
-                MTLPackedFloat3Make(matrixModelToWorld.columns.3.x, matrixModelToWorld.columns.3.y, matrixModelToWorld.columns.3.z)
-            )),
-            options: .opaque,
-            mask: 0xFF,
-            intersectionFunctionTableOffset: 0,
-            accelerationStructureIndex: 0
-        )
-        instAccelStructDescBuffer = device.makeBuffer(bytes: &instAccelStructDescBufferContents, length: MemoryLayout<MTLAccelerationStructureInstanceDescriptor>.size)!
-        instAccelStructDesc.instanceDescriptorBuffer = instAccelStructDescBuffer
-        
-        let instAccelStructSizes = device.accelerationStructureSizes(descriptor: instAccelStructDesc)
-        instAccelStruct = device.makeAccelerationStructure(size: instAccelStructSizes.accelerationStructureSize)!
-        
-        instAccelStructRebuildBuf       = device.makeBuffer(length: instAccelStructSizes.buildScratchBufferSize, options: .storageModePrivate)!
-        instAccelStructRebuildBuf.label = "instAccelStructRebuildBuf"
-        
-        instAccelStructRefitBuf       = device.makeBuffer(length: instAccelStructSizes.refitScratchBufferSize, options: .storageModePrivate)!
-        instAccelStructRefitBuf.label = "instAccelStructRefitBuf"
-        
-        // ======================================
         // Initiate build Acceleration Structures
         // ======================================
         let cmdBuf = cmdQueue.makeCommandBufferWithUnretainedReferences()!
@@ -228,9 +208,7 @@ class ModelAccelerationStructure {
         enc.useHeap(primAccelStructHeap)
         enc.useResource(vertexBuffer, usage: .read)
         enc.useResource(indexBuffer, usage: .read)
-        enc.useResource(instAccelStructDescBuffer, usage: .read)
         enc.build(accelerationStructure: primAccelStruct, descriptor: primAccelStructDesc, scratchBuffer: primAccelStructScratchBuf, scratchBufferOffset: 0)
-        enc.build(accelerationStructure: instAccelStruct, descriptor: instAccelStructDesc, scratchBuffer: instAccelStructRebuildBuf, scratchBufferOffset: 0)
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
@@ -238,28 +216,41 @@ class ModelAccelerationStructure {
     }
     
     public func update(_ update: UpdateType, _ device: MTLDevice, _ cmdQueue: MTLCommandQueue) {
+        matrixModelToWorld = float4x4(rows: [
+            SIMD4<Float32>(1.0, 0.0, 0.0, 0.1),
+            SIMD4<Float32>(0.0, 1.0, 0.0, 0.0),
+            SIMD4<Float32>(0.0, 0.0, 1.0, 0.0),
+            SIMD4<Float32>(0.0, 0.0, 0.0, 1.0),
+        ]) * matrixModelToWorld;
+        triAccelStruct.transformationMatrixBuffer!.contents().assumingMemoryBound(to: MTLPackedFloat4x3.self).pointee = MTLPackedFloat4x3(columns: (
+            MTLPackedFloat3Make(matrixModelToWorld.columns.0.x, matrixModelToWorld.columns.0.y, matrixModelToWorld.columns.0.z),
+            MTLPackedFloat3Make(matrixModelToWorld.columns.1.x, matrixModelToWorld.columns.1.y, matrixModelToWorld.columns.1.z),
+            MTLPackedFloat3Make(matrixModelToWorld.columns.2.x, matrixModelToWorld.columns.2.y, matrixModelToWorld.columns.2.z),
+            MTLPackedFloat3Make(matrixModelToWorld.columns.3.x, matrixModelToWorld.columns.3.y, matrixModelToWorld.columns.3.z)
+        ))
+    
         let cmdBuf = cmdQueue.makeCommandBuffer()!
         let enc = cmdBuf.makeAccelerationStructureCommandEncoder()!
         enc.useHeap(primAccelStructHeap)
         enc.useResource(vertexBuffer, usage: .read)
         enc.useResource(indexBuffer, usage: .read)
-        enc.useResource(instAccelStructDescBuffer, usage: .read)
         switch update {
         case .refit:
+            assert(false, "THIS DOES NOT WORK RIGHT NOW (BETA 5)");
             print("refitting...")
             enc.refit(
-                sourceAccelerationStructure:      instAccelStruct,
-                descriptor:                       instAccelStructDesc,
+                sourceAccelerationStructure:      primAccelStruct,
+                descriptor:                       primAccelStructDesc,
                 destinationAccelerationStructure: nil,
-                scratchBuffer:                    instAccelStructRefitBuf,
+                scratchBuffer:                    primAccelStructRefitBuf,
                 scratchBufferOffset:              0
             )
         case .rebuild:
             print("rebuilding...")
             enc.build(
-                accelerationStructure: instAccelStruct,
-                descriptor:            instAccelStructDesc,
-                scratchBuffer:         instAccelStructRebuildBuf,
+                accelerationStructure: primAccelStruct,
+                descriptor:            primAccelStructDesc,
+                scratchBuffer:         primAccelStructRebuildBuf,
                 scratchBufferOffset:   0
             )
         }
